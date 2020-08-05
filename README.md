@@ -1,2 +1,11 @@
 # wnba-play-by-play
-Scrape WNBA play-by-play data from WNBA.com and ESPN.com
+
+WNBA play-by-play data scraped from WNBA.com 
+\begin{itemize}
+	\item Data zipped by year
+	\item Code used to scrape/clean data included
+\end{itemize}
+
+ESPN.com data in progress!
+
+
