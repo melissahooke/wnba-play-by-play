@@ -1,3 +1,5 @@
 .DS_Store
 data/
 .ipynb_checkpoints/
+*.json
+espn.com/espn-pbp-all.csv
