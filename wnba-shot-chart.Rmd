@@ -1,0 +1,132 @@
+---
+title: "wnba-shot-charts"
+output: pdf_document
+---
+
+
+```{r}
+data = read.csv("espn.com/espn-pbp-2020.csv")
+```
+
+
+Flip the other end of the court to this side
+```{r}
+data = data %>% mutate(ycoord = ifelse(xcoord>50,100-ycoord,ycoord)) %>% 
+  mutate(xcoord = ifelse(xcoord>50,100-xcoord,xcoord))
+  
+```
+
+
+```{r,fig.height=7,fig.width=5.5}
+data %>%  ggplot(aes(x=xcoord,y=ycoord)) + geom_point() + facet_wrap(~EventTeam,nrow=4,ncol=3)
+```
+
+
+There may still be heaves here from the other side of the court
+```{r,fig.height=7,fig.width=5.5}
+data %>%  ggplot(aes(x=xcoord,y=ycoord)) + 
+  stat_binhex(bins = 25, alpha = 0.9) + 
+  facet_wrap(~EventTeam,nrow=4,ncol=3) + 
+  scale_fill_gradient(low = "green", high = "red", trans = 'log') +
+  theme_bw()
+```
+
+Smooth using a GP!
+```{r}
+#covariance function compatible with multidimensional input vectors
+cov_fxn = function(xp,xq) {
+  #kron.delta = (sum(xp==xq) == length(xp)) #check whether p==q (we don't have to worry about length(xp)!=length(x1))
+  cov = sigma2f*exp(-.5*sum((abs(xp-xq)/l)^2)) #+ kron.delta*sigma2n #if you add the noise here, it gets messed up when multiple inputs are the same
+  return(cov)
+}
+
+k = function(x,x1) {
+  K = matrix(NA,nrow=ncol(x),ncol=ncol(x1))
+  for (i in 1:ncol(x)){
+    for (j in 1:ncol(x1)){
+      K[i,j] = cov_fxn(x[,i],x1[,j])
+    }
+  }
+  return(K)
+}
+
+#GP function
+gp = function(X,y,new_xs,sigma2f,sigma2n,l) {
+  n_new = ncol(new_xs)
+  L = t(chol(k(X,X)+sigma2n*diag(1,nrow=ncol(X)))) #add the noise here
+  alpha = as.matrix(solve(t(L),solve(L,y)))
+  #Loop through the test points
+  f_star_bar = rep(0,n_new)
+  vf = rep(0,n_new)
+  vp = rep(0,n_new)
+  logpyX = rep(0,n_new)
+  for (i in 1:n_new) {
+    x_star = as.matrix(new_xs[,i])
+    k_star = k(X,x_star)
+    f_star_bar[i] = t(k_star) %*% alpha
+    v = solve(L,k_star)
+    vf[i] = k(x_star,x_star) - t(v) %*% v
+    vp[i] = vf[i] + sigma2n
+    logpyX[i] = -.5*t(y)%*%alpha - sum(log(diag(L))-n/2*log(2*pi))
+  }
+  output = list(f_star_bar,vf,vp,logpyX)
+  names(output) = c("f_star_bar","vf","vp","logpyX")
+  return(output)
+}
+```
+
+```{r}
+temp = data %>% filter(EventTeam=="LV") %>% group_by(xcoord,ycoord) %>% summarize(num = n())
+X = temp[,1:2]
+X = t(data.frame(lapply(X, scale)))
+y = t(temp[,3])
+
+sigma2f = 1
+sigma2n = .001
+l = .1
+
+
+breaks = 300
+xcoord = seq(0,100,length.out = breaks)
+ycoord = seq(0,100,length.out = breaks)
+new_xs = t(as.matrix(expand.grid(xcoord,ycoord)))
+
+model = gp(X,y,new_xs,sigma2f,sigma2n,l)
+```
+
+
+```{r}
+p = list(xcoord,ycoord)
+kriging(temp$xcoord, temp$ycoord, temp$`n()`, model = "spherical", lags = 10, pixels = 100, polygons = p)
+```
+
+```{r}
+#temp2 = SpatialPointsDataFrame(temp[,1,2],data = temp$num)
+names(temp) = c("x","y","num")
+autoKrige(num~1,temp)
+```
+```{r}
+data(meuse)
+```
+
+
+```
+L = t(chol(k(X,X)+sigma2n*diag(1,nrow=ncol(X)))) #chol() was giving the upper triangular instead of the lower triangular
+alpha = as.matrix(solve(t(L),solve(L,y)))
+
+#Loop through the test points
+f_star_bar = rep(0,n_new)
+vf = rep(0,n_new)
+vp = rep(0,n_new)
+logpyX = rep(0,n_new)
+for (i in 1:n_new) {
+  x_star = as.matrix(new_xs[,i])
+  k_star = k(X,x_star)
+  f_star_bar[i] = t(k_star) %*% alpha
+  v = solve(L,k_star)
+  vf[i] = k(x_star,x_star) - t(v) %*% v
+  vp[i] = vf[i] + sigma2n
+  logpyX[i] = -.5*t(y)%*%alpha - sum(log(diag(L))-n/2*log(2*pi))
+}
+```
+
