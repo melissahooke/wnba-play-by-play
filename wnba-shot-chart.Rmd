@@ -5,20 +5,40 @@ output: pdf_document
 
 
 ```{r}
-data = read.csv("espn.com/espn-pbp-2020.csv")
+library(tidyverse)
+```
+
+
+```{r}
 ```
 
 
 Flip the other end of the court to this side
 ```{r}
-data = data %>% mutate(ycoord = ifelse(xcoord>50,100-ycoord,ycoord)) %>% 
-  mutate(xcoord = ifelse(xcoord>50,100-xcoord,xcoord))
-  
+data = read.csv("espn.com/espn-pbp-2020.csv")
+
+data = data %>%
+  mutate(xcoord = xcoord*94/100) %>%
+  mutate(ycoord = ycoord*50/100)
+
+data %>%  ggplot(aes(x=xcoord,y=ycoord)) + geom_point() + 
+  facet_wrap(~EventTeam,nrow=4,ncol=3) + 
+  geom_vline(xintercept = 0,col="red") + 
+  geom_hline(yintercept = 0,col="red") + 
+  geom_hline(yintercept = 50, col="red")
+
+
+data$xcoord %>% summary()
+data$ycoord %>% summary()
+
+data = data %>% mutate(ycoord = ifelse(xcoord>47,50-ycoord,ycoord)) %>% #still need to learn which direction each team is going for over half shots
+  mutate(xcoord = ifelse(xcoord>47,94-xcoord,xcoord))
+
 ```
 
 
 ```{r,fig.height=7,fig.width=5.5}
-data %>%  ggplot(aes(x=xcoord,y=ycoord)) + geom_point() + facet_wrap(~EventTeam,nrow=4,ncol=3)
+data %>%  ggplot(aes(x=xcoord,y=ycoord)) + geom_point() + facet_wrap(~EventTeam,nrow=4,ncol=3) + geom_vline(xintercept = 0,col="red") + geom_hline(yintercept = 0,col="red") + geom_hline(yintercept = 50, col="red")
 ```
 
 
@@ -30,6 +50,55 @@ data %>%  ggplot(aes(x=xcoord,y=ycoord)) +
   scale_fill_gradient(low = "green", high = "red", trans = 'log') +
   theme_bw()
 ```
+
+```{r}
+data$rebound = NA
+data$shouldberebound = NA
+for (row in 1:(nrow(data)-1)) {
+  if (data[row,"ShotOutcome"] == "missed") {
+    data[(row+1),"shouldberebound"] = "yes"
+    if (grepl("defensive",data[(row+1),"EventDescription"])) {
+      data[row,"rebound"] = "defensive"
+      data[(row+1),"rebound"] = "defensive"
+    }
+    if (grepl("offensive",data[(row+1),"EventDescription"])) {
+      data[row,"rebound"] = "offensive"
+      data[(row+1),"rebound"] = "offensive"
+    }
+  }
+}
+
+data %>% dplyr::select(EventDescription,ShotOutcome,rebound,shouldberebound)
+
+data %>% filter((ShotOutcome=="missed" & is.na(rebound))|(shouldberebound=="yes"& is.na(rebound)))
+```
+```{r}
+data %>% filter(rebound=="defensive") %>% ggplot(aes(x=xcoord,y=ycoord)) + 
+  stat_binhex(bins = 25, alpha = 0.9) + 
+  #facet_wrap(~EventTeam,nrow=4,ncol=3) + 
+  scale_fill_gradient(low = "green", high = "red", trans = 'log') +
+  theme_bw()
+
+data %>% filter(rebound=="offensive") %>% ggplot(aes(x=xcoord,y=ycoord)) + 
+  stat_binhex(bins = 25, alpha = 0.9) + 
+  #facet_wrap(~EventTeam,nrow=4,ncol=3) + 
+  scale_fill_gradient(low = "green", high = "red", trans = 'log') +
+  theme_bw()
+```
+
+```{r}
+center_of_rim = (48+15)/12
+data = data %>% mutate(shot_distance = sqrt((xcoord-center_of_rim)^2+(ycoord-25)^2))
+data = data %>% mutate(shot_location = ifelse(ShotOutcome!="",ifelse(shot_distance < 4, "restricted area",
+                                             ifelse(xcoord<19 & ycoord < 33 & ycoord > 17, "paint",
+                                                    ifelse(shot_distance > 22.15 | ycoord > 25+22.15 | ycoord < 25-22.15, "three", "midrange"))),NA))
+
+data %>% filter(ShotOutcome!="" & ShotOutcome!="made") %>%
+  filter(!is.na(rebound)) %>% group_by(shot_location,rebound) %>% 
+  summarize(n=n()) %>% 
+  mutate(freq = n / sum(n)) 
+```
+
 
 Smooth using a GP!
 ```{r}

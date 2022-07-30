@@ -1,0 +1,128 @@
+---
+title: "4-jump-ball-1st-basket-prob"
+output: pdf_document
+---
+
+```{r}
+library(tidyverse)
+library(brms)
+library(tidybayes)
+```
+
+```{r}
+data = read.csv("espn.com/espn-pbp-1997-2021-v2.csv")
+data = data %>% filter(grepl("2021\\-",Date))
+
+#data = read.csv("espn.com/espn-pbp-2022.csv") %>% filter(GameType=="regular season")
+```
+
+```{r}
+head(data)
+```
+
+
+```{r}
+jumps = data %>% filter(grepl(" vs\\. ",EventDescription) & Time=="10:00" & Quarter==1) 
+jumps[jumps %>% dplyr::select(GameID) %>% duplicated(),]
+jumps = jumps %>% dplyr::select(GameID,EventTeam) %>% dplyr::rename(WonJump = EventTeam)
+```
+
+```{r}
+makes = data %>% filter(grepl("makes",EventDescription))
+indices = makes %>% dplyr::select(GameID) %>% duplicated()
+first_score = makes[!indices,] %>% dplyr::select(GameID,EventTeam,HomeTeam,AwayTeam) %>%
+  dplyr::rename(ScoredFirst = EventTeam)
+```
+
+```{r}
+cleaned_data = first_score %>% left_join(jumps)
+cleaned_data
+```
+
+```{r}
+cleaned_data = data %>% dplyr::select(GameID,EventTeam) %>% unique() %>% left_join(cleaned_data) %>%
+  mutate(WonJump01 = ifelse(EventTeam==WonJump,1,0)) %>%
+  mutate(ScoredFirst01 = ifelse(EventTeam==ScoredFirst,1,0))
+```
+
+```{r}
+cleaned_data %>% group_by(EventTeam) %>% dplyr::summarise(won=sum(WonJump01),N=n()) %>% mutate(perc = won/N)
+```
+
+
+```{r}
+model = brm(ScoredFirst01~ 1 + WonJump01 + (1 + WonJump01|EventTeam),family=bernoulli(),
+            data = cleaned_data, cores = 4, chains = 4)
+```
+```{r}
+model
+```
+
+
+```{r}
+coefs = data.frame(model) %>% dplyr::select(starts_with("r_EventTeam"))
+names(coefs) = gsub("r_EventTeam\\.","",names(coefs))
+names(coefs) = gsub("\\.$","",names(coefs))
+
+int_coefs = coefs %>% dplyr::select(ends_with("Intercept")) %>% 
+  pivot_longer(cols=ends_with("Intercept"),names_to = "Team",values_to = "Intercept") %>%
+  mutate(Team = gsub("\\.Intercept","",Team))
+jump_b = coefs %>% dplyr::select(ends_with("WonJump01")) %>% 
+  pivot_longer(cols=ends_with("WonJump01"),names_to = "Team",values_to = "WonJump01") %>%
+  mutate(Team = gsub("\\.WonJump01","",Team)) %>%
+  dplyr::select(-Team)
+
+coefs = cbind(int_coefs,jump_b)
+
+# prob given won jump
+coefs %>% mutate(prob = inv_logit_scaled(Intercept+WonJump01)) %>%
+  ggplot(aes(x=Team,y=prob)) + stat_pointinterval() +
+  ggtitle("Model probability of scoring first, given team won jump (2021 regular season data)") + ylim(c(0,1))
+
+# prob given not won jump
+coefs %>% mutate(prob = inv_logit_scaled(Intercept)) %>%
+  ggplot(aes(x=Team,y=prob)) + stat_pointinterval() +
+  ggtitle("Model probability of scoring first, given team lost jump (2021 regular season data)") + ylim(c(0,1))
+```
+
+```{r}
+model_scoring_only = brm(ScoredFirst01~ 1 + (1|EventTeam),family=bernoulli(),
+            data = cleaned_data, cores = 4, chains = 4)
+```
+
+```{r}
+coefs = data.frame(model_scoring_only) %>% dplyr::select(starts_with("r_EventTeam"))
+names(coefs) = gsub("r_EventTeam\\.","",names(coefs))
+names(coefs) = gsub("\\.$","",names(coefs))
+
+int_coefs = coefs %>% dplyr::select(ends_with("Intercept")) %>% 
+  pivot_longer(cols=ends_with("Intercept"),names_to = "Team",values_to = "Intercept") %>%
+  mutate(Team = gsub("\\.Intercept","",Team))
+
+# prob of scoring first
+int_coefs %>% mutate(prob = inv_logit_scaled(Intercept)) %>%
+  ggplot(aes(x=Team,y=prob)) + stat_pointinterval() +
+  ggtitle("Probability of scoring first (2021 regular season data)") + ylim(c(0,1))
+```
+
+
+```{r}
+model_jump_only = brm(WonJump01~ 1 + (1|EventTeam),family=bernoulli(),
+            data = cleaned_data, cores = 4, chains = 4)
+```
+
+```{r}
+coefs = data.frame(model_jump_only) %>% dplyr::select(starts_with("r_EventTeam"))
+names(coefs) = gsub("r_EventTeam\\.","",names(coefs))
+names(coefs) = gsub("\\.$","",names(coefs))
+
+int_coefs = coefs %>% dplyr::select(ends_with("Intercept")) %>% 
+  pivot_longer(cols=ends_with("Intercept"),names_to = "Team",values_to = "Intercept") %>%
+  mutate(Team = gsub("\\.Intercept","",Team))
+
+# prob of scoring first
+int_coefs %>% mutate(prob = inv_logit_scaled(Intercept)) %>%
+  ggplot(aes(x=Team,y=prob)) + stat_pointinterval() +
+  ggtitle("Model probability of winning jump (2021 regular season data)") + ylim(c(0,1))
+```
+

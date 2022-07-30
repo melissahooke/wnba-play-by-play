@@ -1,0 +1,441 @@
+---
+title: "WNBA-technical-fouls"
+output: pdf_document
+---
+
+```{r}
+library(tidyverse)
+library(brms)
+library(tidybayes)
+'%!in%' <- function(x,y)!('%in%'(x,y))
+```
+
+```{r}
+data = read.csv("espn.com/espn-pbp-1997-2021-v2.csv")
+game_info = read.csv('espn.com/game_info.csv')
+```
+
+```{r}
+# join to get the year info and eventually other game info if needed
+data = data %>% left_join(game_info)
+data = data %>% mutate(year = as.factor(year))
+
+# table of number of total games per year
+data %>% 
+  dplyr::select(GameID,year) %>% 
+  unique() %>% group_by(year) %>% 
+  dplyr::summarise(num_games=n())
+
+data = data %>% filter(year!=2002 & year!=2022) %>% # 2002 not enough games
+  filter(GameType != "preseason") %>% # remove preseason for this analysis
+  filter(!(HomeTeam == "EAST"|HomeTeam=="WEST")) # remove all-star game
+
+# get total number of games per year again to compute league avg. technical rate later
+games_per_year = data %>% 
+  dplyr::select(GameID,year) %>% 
+  unique() %>% group_by(year) %>% 
+  dplyr::summarise(num_games=n())
+```
+
+
+
+
+# Team name cleaning
+```{r}
+# print all unique teams
+data$EventTeam %>% unique()
+
+data = data %>% mutate(EventTeam = ifelse(EventTeam=="WSH","WAS",
+                                          ifelse(EventTeam=="CT","CONN",
+                                                 ifelse(EventTeam=="NY","NYL",
+                                                        ifelse(EventTeam=="PHO","PHX",
+                                                               ifelse(EventTeam=="LOS","LA",
+                                                                      ifelse(EventTeam=="SA","SAS",EventTeam)))))))
+
+data = data %>% mutate(AwayTeam = ifelse(AwayTeam=="WSH","WAS",
+                                          ifelse(AwayTeam=="CT","CONN",
+                                                 ifelse(AwayTeam=="NY","NYL",
+                                                        ifelse(AwayTeam=="PHO","PHX",
+                                                               ifelse(AwayTeam=="LOS","LA",
+                                                                      ifelse(AwayTeam=="SA","SAS",AwayTeam)))))))
+
+data = data %>% mutate(HomeTeam = ifelse(HomeTeam=="WSH","WAS",
+                                          ifelse(HomeTeam=="CT","CONN",
+                                                 ifelse(HomeTeam=="NY","NYL",
+                                                        ifelse(HomeTeam=="PHO","PHX",
+                                                               ifelse(HomeTeam=="LOS","LA",
+                                                                      ifelse(HomeTeam=="SA","SAS",HomeTeam)))))))
+
+# get number of games per team in order to normalize technical rates later
+games_per_year_by_team = data %>% 
+  dplyr::select(GameID,year,EventTeam) %>% 
+  unique() %>% 
+  group_by(year,EventTeam) %>% 
+  dplyr::summarise(num_games=n())
+games_per_year_by_team
+
+# get list of games for poisson model for when there were no technicals in a game
+all_games = data %>% dplyr::select(GameID,year,EventTeam) %>% unique()
+```
+
+```{r}
+# did DT play? use the PBP to deduce whether DT played at all. This will be a variable in the model later
+did_dt_play = data %>% mutate(DT_play = grepl("Taurasi",EventDescription)) %>% group_by(GameID) %>% dplyr::summarise(DT_played = max(DT_play))
+```
+
+
+```{r}
+# now use regex to get the PBP rows that have technical fouls
+data = data %>% mutate(tech = grepl("[Tt]ech",EventDescription))
+
+# is there anything other than tech fouls or free throws?
+data %>% filter(tech) %>% 
+  filter(!grepl("[Tt]ech.*cal [Ff]ree [Tt]hrow",EventDescription))  %>% # remove technical free throws
+  filter(!grepl("[Ff]oul",EventDescription))
+```
+
+# Clean double techs by adding a second row
+```{r}
+# filter data to all techs, removing the free throws
+techs = data %>% filter(tech) %>% 
+  filter(!grepl("[Tt]ech.*cal [Ff]ree [Tt]hrow",EventDescription))
+
+# new column to track who the technical foul was against
+techs$TechPlayer = NA
+
+# print all of the double technicals so we can see the patterns in the descriptions
+techs %>% filter(grepl("[Dd]ouble",EventDescription))
+
+# assign the name of the first player
+techs = techs %>% mutate(TechPlayer = ifelse(grepl("[Dd]ouble",EventDescription), # assign for pattern 1
+                                     gsub(" and.*","",gsub("Double [Tt]echnical [Ff]oul: ","",EventDescription)),
+                                     NA)) %>% 
+  mutate(TechPlayer = ifelse(grepl("gains possession",EventDescription), # assign for pattern 2
+                                     gsub(" Double Technical.*","",EventDescription),
+                                     TechPlayer))
+
+
+# assign the name of the second player
+doubles = techs %>% filter(grepl("[Dd]ouble",EventDescription)) %>% 
+  mutate(EventTeam = ifelse(EventTeam==HomeTeam,AwayTeam,HomeTeam)) %>% # swap the team who the foul is against
+  mutate(HomeOrAway = ifelse(HomeOrAway=="home","away","home"))  %>%  # swap home and away
+  mutate(TechPlayer = ifelse(grepl("[Dd]ouble",EventDescription), # assign for pattern 1
+                             gsub(".*and ","",EventDescription),
+                             NA)) %>%
+  mutate(TechPlayer = ifelse(grepl("gains possession",EventDescription), # assign for pattern 2
+                                     gsub("gains possession\\.","",
+                                          gsub(".*Double Technical Foul\\. ","",EventDescription)),
+                                     TechPlayer))
+
+# now bind on those additional rows
+techs = rbind(techs,doubles)
+
+
+# get the player who committed the tech for all techs that weren't double techs
+techs = techs %>% 
+  mutate(TechPlayer = ifelse(grepl("[Dd]ouble",EventDescription),
+                             TechPlayer,
+                             gsub(" ?(flopping|indirect)? ?[Tt]echnical [Ff]oul.*| ?[Dd]efensive.*| [Nn]on.*| [Tt]aunting [Tt]echnical.*","",EventDescription))) %>% 
+  mutate(TechPlayer = ifelse(TechPlayer %in% c("delay techfoul","Delay of Game Technical","- Bench","non unsport techfoul","Too Many Players Technical","excess timeout techfoul"),"",TechPlayer)) # some weird PBP entries
+```
+
+```{r}
+# label the defensive 3-second techs
+techs = techs %>% mutate(TechType = ifelse(grepl("[Dd]efensive",EventDescription),"Defensive 3-Second","Other"))
+```
+
+
+# All-time technical fouls by franchise
+```{r}
+techs %>% ggplot(aes(x=EventTeam)) + geom_bar()
+
+#same plot but exclude the old franchises
+techs %>% filter(EventTeam %!in% c("SA","SAS","WEST","EAST","TUL","HOU","CHA","SAC")) %>%
+  ggplot(aes(x=EventTeam)) + geom_bar()
+```
+
+
+```{r}
+# plot technicals by year: the big jump is due to the defensive 3-second techs
+techs %>% ggplot(aes(x=year,fill=TechType)) + geom_bar()
+
+techs %>% group_by(year) %>% summarize(num_techs = n()) %>% 
+  left_join(games_per_year) %>% 
+  mutate(techs_per_game = num_techs/num_games) %>%
+  ggplot(aes(x=year,y=techs_per_game)) + 
+  geom_col()
+```
+
+# Not Defensive 3-Second 
+```{r}
+# excluding defensive 3-second techs
+non_def_techs = techs %>% filter(TechType != "Defensive 3-Second")
+
+# number of techs per year excluding defensive 3-second techs
+non_def_techs %>% ggplot(aes(x=year)) + geom_bar()
+
+# same plot normalized for number of games
+non_def_techs %>% group_by(year) %>% summarize(num_techs = n()) %>% 
+  left_join(games_per_year) %>% 
+  mutate(techs_per_game = num_techs/num_games) %>%
+  ggplot(aes(x=year,y=techs_per_game)) + 
+  geom_col()
+```
+# Defensive 3-Second Technicals
+```{r}
+def_techs = techs %>% filter(TechType=="Defensive 3-Second") 
+
+def_techs %>% ggplot(aes(x=year,fill=GameType)) + geom_bar() + facet_wrap(~EventTeam)
+
+def_techs %>% ggplot(aes(x=year,fill=TechType)) + geom_bar()
+
+def_techs %>% group_by(year) %>% summarize(num_techs = n()) %>% 
+  left_join(games_per_year) %>% #mutate(year = as.numeric(as.character(year))) %>%
+  mutate(techs_per_game = num_techs/num_games) %>%
+  ggplot(aes(x=year,y=techs_per_game)) + 
+  geom_col()
+```
+
+```{r}
+non_def_techs %>% group_by(year) %>% summarize(num_techs = n()) %>% 
+  left_join(games_per_year) %>% mutate(year = as.numeric(as.character(year))) %>%
+  mutate(techs_per_game = num_techs/num_games) %>%
+  ggplot(aes(x=year,y=techs_per_game)) + 
+  geom_line()
+
+league_avg = non_def_techs %>% group_by(year) %>% summarize(num_techs = n()) %>% 
+  left_join(games_per_year) %>% mutate(year = as.numeric(as.character(year))) %>%
+  mutate(techs_per_game = num_techs/num_games)
+
+non_def_techs %>% ggplot(aes(x=EventTeam)) + geom_bar()
+non_def_techs %>% filter(EventTeam %!in% c("SA","SAS","WEST","EAST","TUL","HOU","CHA","SAC")) %>% 
+  ggplot(aes(x=EventTeam)) + geom_bar()
+
+non_def_techs %>% ggplot(aes(x=year,fill=GameType)) + geom_bar() + facet_wrap(~EventTeam,) + scale_x_discrete(breaks=c(2003,2012,2021)) + ggtitle("Number of technical fouls per team by year\n2003-2021 (Excluding def 3-sec techs)")
+```
+
+```{r}
+# plot tech rate over time for each team all on the same plot
+non_def_techs %>% group_by(year,EventTeam) %>% summarize(num_techs = n()) %>% 
+  left_join(games_per_year_by_team) %>% mutate(year = as.numeric(as.character(year))) %>%
+  mutate(techs_per_game = num_techs/num_games) %>%
+  ggplot(aes(x=year,y=techs_per_game,col=EventTeam)) + 
+  geom_line()
+
+# now in boxplot form so you can see the league trends better
+non_def_techs %>% group_by(year,EventTeam) %>% summarize(num_techs = n()) %>% 
+  left_join(games_per_year_by_team) %>% 
+  mutate(techs_per_game = num_techs/num_games) %>%
+  ggplot(aes(x=year,y=techs_per_game)) + 
+  geom_boxplot()
+```
+
+
+```{r}
+league_avg_to_subtract = league_avg %>% 
+  dplyr::select(year,techs_per_game) %>% 
+  dplyr::rename(league_avg=techs_per_game) %>% mutate(league_avg=league_avg/2)
+
+# plot difference from league average all on one plot
+non_def_techs %>% group_by(year,EventTeam) %>% summarize(num_techs = n()) %>% 
+  left_join(games_per_year_by_team) %>% 
+  mutate(techs_per_game = num_techs/num_games) %>% ungroup() %>%
+  mutate(year = as.numeric(as.character(year))) %>%
+  left_join(league_avg_to_subtract) %>%
+  mutate(diff_from_league_avg = techs_per_game-league_avg) %>%
+  mutate(year = as.numeric(as.character(year))) %>%
+  ggplot(aes(x=year,y=diff_from_league_avg,col=EventTeam)) + 
+  geom_line()
+
+# plot difference for each team with the delta highlighted
+non_def_techs %>% group_by(year,EventTeam) %>% summarize(num_techs = n()) %>% 
+  left_join(games_per_year_by_team) %>% 
+  mutate(techs_per_game = num_techs/num_games) %>% ungroup() %>%
+  mutate(year = as.numeric(as.character(year))) %>%
+  left_join(league_avg_to_subtract) %>%
+  mutate(diff_from_league_avg = techs_per_game-league_avg) %>%
+  ggplot(aes(x=year,y=diff_from_league_avg)) + 
+  geom_col(aes(fill = diff_from_league_avg <0)) + 
+  facet_wrap(~EventTeam) + theme(legend.position = "none") +
+  ggtitle("Rate of technical fouls per game by team relative to league average\n2003-2021 (Excluding def 3-sec techs)")
+```
+
+
+
+
+
+# Diana Taurasi Technical Fouls
+
+```{r}
+# who are the league leaders in all-time technicals
+non_def_techs %>% group_by(TechPlayer) %>% 
+  dplyr::summarize(num_techs=n()) %>% 
+  filter(TechPlayer!="") %>% 
+  arrange(desc(num_techs)) %>% dplyr::rename("Career Technical Fouls (2003-2021)"=num_techs,
+                                             Player = TechPlayer)
+```
+
+```{r}
+# count of techs per year
+non_def_techs %>% filter(TechPlayer == "Diana Taurasi") %>% 
+  #mutate(year = as.numeric(as.character(year))) %>%
+  ggplot(aes(x=year)) + 
+  geom_bar(fill="orange") + ggtitle("Diana Taurasi Technical Fouls by Year")
+
+# dt share of mercury technical fouls
+non_def_techs %>% filter(EventTeam == "PHX") %>% filter(year!="2003") %>%
+  mutate(EventTeam = ifelse(TechPlayer=="Diana Taurasi","Diana Taurasi","a")) %>%
+  #mutate(year = as.numeric(as.character(year))) %>%
+  ggplot(aes(x=year)) + 
+  geom_bar(aes(fill=EventTeam)) +
+  #geom_bar(data=subset(non_def_techs,TechPlayer == "Diana Taurasi"),fill="orange")  + 
+  ggtitle("Diana Taurasi share of Mercury technical fouls by year") + theme_bw() + 
+  scale_fill_manual(name = "Technical Against",values=c("purple","orange"),labels=c("Other Mercury Players","Diana Taurasi")) + 
+  theme(legend.position = "bottom")
+```
+https://www.basketball-reference.com/wnba/players/t/tauradi01w.html
+```{r}
+# use external data for the number of minutes played
+dt = read.csv("taurasi-minutes-played.csv") %>% dplyr::select(Year,G,MP) 
+names(dt) = c("year","num_games","minutes_per_game")
+dt = dt %>% mutate(year = as.factor(year))
+
+# filter dataset to only dt fouls for some plotting
+dt_data = non_def_techs %>% filter(TechPlayer == "Diana Taurasi") %>% 
+  group_by(year) %>% 
+  summarize(num_techs = n()) %>% 
+  left_join(dt) %>% mutate(year = as.numeric(as.character(year))) %>%
+  mutate(total_mins_played = num_games*minutes_per_game)
+```
+
+
+
+```{r}
+# techs per games played by year 
+dt_data %>% 
+  ggplot(aes(x=year,y=num_techs/num_games)) + 
+  geom_col(fill="orange") + ggtitle("Diana Taurasi technical fouls per games played")
+
+# techs per total minutes played by year 
+dt_data %>%
+  ggplot(aes(x=year,y=num_techs/(num_games*minutes_per_game))) + 
+  geom_col(fill="orange") + ggtitle("Diana Taurasi Technicals per Minutes Played")
+```
+
+
+TO DO: delete the years that Taurasi didn't play from these plots
+```{r}
+non_def_techs %>% mutate(EventTeam = ifelse(TechPlayer=="Diana Taurasi","Taurasi",EventTeam)) %>% ggplot(aes(x=year,fill=GameType)) + geom_bar() + facet_wrap(~EventTeam)
+
+# get tech rate and diff from league rate for DT
+dt_temp = dt_data %>% dplyr::select(-minutes_per_game,-total_mins_played) %>%
+  mutate(year = as.numeric(as.character(year))) %>%
+  mutate(EventTeam = "Taurasi") %>% mutate(techs_per_game = num_techs/num_games) %>% ungroup() %>%
+  left_join(league_avg_to_subtract) %>%
+  mutate(diff_from_league_avg = techs_per_game-league_avg)
+
+# get tech rate and diff from league rate for mercury minus DT
+temp = non_def_techs %>% filter(TechPlayer!="Diana Taurasi") %>%
+  group_by(year,EventTeam) %>% summarize(num_techs = n()) %>% 
+  left_join(games_per_year_by_team) %>%
+  mutate(year = as.numeric(as.character(year))) %>%
+  mutate(techs_per_game = num_techs/num_games) %>% ungroup() %>%
+  left_join(league_avg_to_subtract) %>%
+  mutate(diff_from_league_avg = techs_per_game-league_avg)
+
+# get tech rate and diff from league rate for everyone else
+temp2 = non_def_techs %>%
+  group_by(year,EventTeam) %>% summarize(num_techs = n()) %>% 
+  left_join(games_per_year_by_team) %>%
+  mutate(year = as.numeric(as.character(year))) %>%
+  mutate(techs_per_game = num_techs/num_games) %>% ungroup() %>%
+  left_join(league_avg_to_subtract) %>%
+  mutate(diff_from_league_avg = techs_per_game-league_avg)
+
+# tech foul rate per game for DT vs Mercury
+temp %>%
+  ggplot(aes(x=year,y=techs_per_game)) + 
+  geom_line(aes(group=EventTeam),subset(temp,EventTeam!="PHX"),alpha=.2) + 
+  geom_line(aes(x=year,y=techs_per_game),subset(temp,EventTeam=="PHX"),col="purple",linetype="dashed") + 
+  geom_line(aes(x=year,y=techs_per_game),subset(temp2,EventTeam=="PHX"),col="purple") + 
+  geom_line(aes(x=year,y=techs_per_game/2),data=league_avg) + 
+  geom_line(aes(x=year,y=techs_per_game),data=dt_temp,col="orange")
+
+# difference from the league avg for DT vs Mercury
+temp %>%
+  ggplot(aes(x=year,y=diff_from_league_avg)) + 
+  geom_line(aes(group=EventTeam),subset(temp,EventTeam!="PHX"),alpha=.2) + 
+  geom_line(aes(x=year,y=diff_from_league_avg),subset(temp,EventTeam=="PHX"),col="purple",linetype="dashed",cex=1.5) + 
+  geom_line(aes(x=year,y=diff_from_league_avg),subset(temp2,EventTeam=="PHX"),col="purple",cex=1.5) + 
+  geom_line(aes(x=year,y=diff_from_league_avg),data=dt_temp,col="orange",cex=1.5) + 
+  geom_abline(slope=0)
+```
+
+# DT Model
+```{r}
+dt_model = brm(num_techs~num_games,family=poisson(),data=subset(dt_data,year>=2010),chains=4,cores=4)
+data.frame(num_games=30) %>% add_predicted_draws(dt_model) %>% 
+  ungroup() %>%
+  ggplot(aes(x=.prediction)) + 
+  geom_histogram(binwidth = 1)
+```
+
+# Mercury Model
+```{r}
+team_data = techs %>%
+  group_by(GameID,EventTeam,GameType) %>%
+  dplyr::summarise(num_techs = n()) %>% 
+  left_join(all_games,.) %>% 
+  left_join(did_dt_play) %>% 
+  mutate(DT_played = ifelse(is.na(DT_played),0,DT_played)) %>%
+  mutate(num_techs = ifelse(is.na(num_techs),0,num_techs)) %>%
+  mutate(year = as.numeric(as.character(year))) %>% 
+  filter(EventTeam %!in% c("SA","SAS","WEST","EAST","TUL","HOU","CHA","SAC"))
+
+merc_model = brm(num_techs~DT_played,family=poisson(),
+                 data=subset(team_data,year>=2010 & EventTeam=="PHX"),chains=4,cores=4)
+```
+
+# Predictions
+TO DO: work in uncertainty on the number of games
+```{r}
+data.frame(DT_played=c(rep(1,26),rep(0,10))) %>% add_predicted_draws(merc_model) %>% 
+  ungroup() %>%
+  group_by(.draw) %>%
+  dplyr::summarise(season_total = sum(.prediction)) %>%
+  ggplot(aes(x=season_total)) + 
+  geom_histogram(binwidth = 1)
+
+data.frame(DT_played=c(rep(1,26),rep(0,10))) %>% add_predicted_draws(merc_model) %>% 
+  ungroup() %>%
+  group_by(.draw) %>%
+  dplyr::summarise(season_total = sum(.prediction)) %>%
+  dplyr::summarise(mean(season_total))
+
+data.frame(num_games=29) %>% add_predicted_draws(dt_model) %>% 
+  ungroup() %>% dplyr::summarise(mean(.prediction))
+```
+
+```{r}
+all_teams_model = brm(num_techs~1+(1|year)+(1|EventTeam),family=poisson(),
+                 data=subset(team_data,year>=2010),chains=4,cores=4)
+
+all_teams_model_DT = brm(num_techs~1+DT_played+(1|year)+(1+DT_played|EventTeam),family=poisson(),
+                 data=subset(team_data,year>=2010),chains=4,cores=4)
+```
+
+```{r}
+coef(all_teams_model_DT)
+```
+
+Who is getting technical fouls on Chicago when playing against Dt?
+```{r}
+techs %>%
+  left_join(all_games,.) %>% 
+  left_join(did_dt_play) %>% 
+  mutate(DT_played = ifelse(is.na(DT_played),0,DT_played)) %>% 
+  filter(DT_played==1 & EventTeam=="CHI" & tech) %>%
+  group_by(TechPlayer) %>%
+  dplyr::summarise(num_techs = n()) %>% arrange(desc(num_techs))
+```
+
