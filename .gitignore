@@ -1,12 +1,6 @@
 .DS_Store
-data/
 .ipynb_checkpoints/
 *.json
-espn.com/espn-pbp-all.csv
-espn.com/example-game.txt
-espn.com/check-2021-data.ipynb
-espn.com/game_info.csv
-not-scraped.csv
 scored-first-plots/Screen Shot 2022-05-24 at 3.34.53 PM.png
 scored-first-plots/Screen Shot 2022-05-24 at 3.35.07 PM.png
 scored-first-plots/Screen Shot 2022-05-24 at 3.35.44 PM.png
